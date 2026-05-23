@@ -2,52 +2,70 @@ pipeline {
   agent any
 
   environment {
-    PROJECT_ID  = "Jenkins-Cicd-project"
-    BUCKET      = "my-jenkins-artifacts-bucket"
-    APP_VM_IP   = "136.116.208.47"
-    APP_DIR     = "/opt/app"
-    JAR_NAME    = "app.jar"
-    CREDS_GCP   = "gcp-sa-key"     // Jenkins credential ID for the JSON key (Secret file)
+    PROJECT_ID = "Jenkins-Cicd-project"
+    BUCKET     = "my-jenkins-artifacts-bucket"
+    ZONE       = "us-central1-c"
+    VM_NAME    = "app-runtime-vm"
+
+    // Path to the jar inside GitHub repo
+    LOCAL_JAR  = "artifacts/app.jar"
+
+    // Where it goes
+    GCS_OBJECT = "app/app.jar"
+    VM_PATH    = "/opt/app/app.jar"
+
+    GCP_KEY_CRED = "gcp-sa-key"
+    GITHUB_CRED  = "github-pat"
   }
 
   stages {
-
-    stage('Checkout') {
+    stage("Checkout") {
       steps {
-        checkout scm
+        git branch: "main",
+            credentialsId: env.GITHUB_CRED,
+            url: "https://github.com/rahulgoud213/Test-Deployment-.git"
       }
     }
 
-    stage('Build JAR') {
+    stage("Verify JAR Exists") {
       steps {
-        sh 'mvn -B clean package -DskipTests'
-        sh 'ls -lh target/*.jar'
+        sh """
+          if [ ! -f "${LOCAL_JAR}" ]; then
+            echo "ERROR: JAR not found at ${LOCAL_JAR}"
+            exit 1
+          fi
+        """
       }
     }
 
-    stage('Upload to GCS') {
+    stage("Auth to GCP") {
       steps {
-        withCredentials([file(credentialsId: "${CREDS_GCP}", variable: 'GOOGLE_APPLICATION_CREDENTIALS')]) {
-          sh '''
-            gcloud auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS"
-            gcloud config set project "$PROJECT_ID"
-            gsutil cp target/*.jar gs://$BUCKET/$JAR_NAME
-          '''
+        withCredentials([file(credentialsId: env.GCP_KEY_CRED, variable: "GCP_KEY_FILE")]) {
+          sh """
+            gcloud auth activate-service-account --key-file="$GCP_KEY_FILE"
+            gcloud config set project ${PROJECT_ID}
+          """
         }
       }
     }
 
-    stage('Deploy to VM') {
+    stage("Upload to GCS") {
       steps {
-        sh '''
-          ssh -o StrictHostKeyChecking=no $APP_VM_IP "
-            sudo mkdir -p $APP_DIR
-            sudo chown \$USER:\$USER $APP_DIR
-            gsutil cp gs://$BUCKET/$JAR_NAME $APP_DIR/$JAR_NAME
-            pkill -f 'java -jar' || true
-            nohup java -jar $APP_DIR/$JAR_NAME > $APP_DIR/app.log 2>&1 &
-          "
-        '''
+        sh """
+          gsutil cp ${LOCAL_JAR} gs://${BUCKET}/${GCS_OBJECT}
+        """
+      }
+    }
+
+    stage("Deploy & Restart") {
+      steps {
+        sh """
+          gcloud compute ssh ${VM_NAME} --zone ${ZONE} --command '
+            sudo mkdir -p /opt/app
+            sudo gsutil cp gs://${BUCKET}/${GCS_OBJECT} ${VM_PATH}
+            sudo systemctl restart myapp || nohup java -jar ${VM_PATH} > /opt/app/app.log 2>&1 &
+          '
+        """
       }
     }
   }
